@@ -94,6 +94,114 @@ int object_exists(const ObjectID *id) {
 // Returns 0 on success, -1 on error.
 
 
+int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
+    char path[512];
+    FILE *f;
+    uint8_t *file_buf = NULL;
+    void *payload = NULL;
+    long file_size_long;
+    size_t file_size;
+    uint8_t *nul_pos;
+    char type_str[16];
+    size_t declared_size;
+    size_t header_len;
+    size_t payload_len;
+    ObjectID computed;
+
+    if (!id || !type_out || !data_out || !len_out) return -1;
+
+    object_path(id, path, sizeof(path));
+    f = fopen(path, "rb");
+    if (!f) return -1;
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return -1;
+    }
+
+    file_size_long = ftell(f);
+    if (file_size_long < 0) {
+        fclose(f);
+        return -1;
+    }
+
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return -1;
+    }
+
+    file_size = (size_t)file_size_long;
+    file_buf = malloc(file_size);
+    if (!file_buf) {
+        fclose(f);
+        return -1;
+    }
+
+    if (file_size > 0 && fread(file_buf, 1, file_size, f) != file_size) {
+        free(file_buf);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    compute_hash(file_buf, file_size, &computed);
+    if (memcmp(computed.hash, id->hash, HASH_SIZE) != 0) {
+        free(file_buf);
+        return -1;
+    }
+
+    nul_pos = memchr(file_buf, '\0', file_size);
+    if (!nul_pos) {
+        free(file_buf);
+        return -1;
+    }
+
+    header_len = (size_t)(nul_pos - file_buf);
+    if (header_len == 0 || sscanf((char *)file_buf, "%15s %zu", type_str, &declared_size) != 2) {
+        free(file_buf);
+        return -1;
+    }
+
+    if (strcmp(type_str, "blob") == 0) {
+        *type_out = OBJ_BLOB;
+    } else if (strcmp(type_str, "tree") == 0) {
+        *type_out = OBJ_TREE;
+    } else if (strcmp(type_str, "commit") == 0) {
+        *type_out = OBJ_COMMIT;
+    } else {
+        free(file_buf);
+        return -1;
+    }
+
+    if (header_len + 1 > file_size) {
+        free(file_buf);
+        return -1;
+    }
+
+    payload_len = file_size - (header_len + 1);
+    if (declared_size != payload_len) {
+        free(file_buf);
+        return -1;
+    }
+
+    payload = malloc(payload_len > 0 ? payload_len : 1);
+    if (!payload) {
+        free(file_buf);
+        return -1;
+    }
+
+    if (payload_len > 0) {
+        memcpy(payload, file_buf + header_len + 1, payload_len);
+    }
+
+    *data_out = payload;
+    *len_out = payload_len;
+
+    free(file_buf);
+    return 0;
+}
+
+
 void compute_hash(const void *data, size_t len, ObjectID *id_out) {
     unsigned int hash_len;
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
