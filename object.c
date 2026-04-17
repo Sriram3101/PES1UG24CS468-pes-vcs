@@ -19,3 +19,29 @@
 #include <openssl/evp.h>
 
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
+
+void hash_to_hex(const ObjectID *id, char *hex_out) {
+    for (int i = 0; i < HASH_SIZE; i++) {
+        sprintf(hex_out + i * 2, "%02x", id->hash[i]);
+    }
+    hex_out[HASH_HEX_SIZE] = '\0';
+}
+
+int hex_to_hash(const char *hex, ObjectID *id_out) {
+    if (strlen(hex) < HASH_HEX_SIZE) return -1;
+    for (int i = 0; i < HASH_SIZE; i++) {
+        unsigned int byte;
+        if (sscanf(hex + i * 2, "%2x", &byte) != 1) return -1;
+        id_out->hash[i] = (uint8_t)byte;
+    }
+    return 0;
+}
+
+void compute_hash(const void *data, size_t len, ObjectID *id_out) {
+    unsigned int hash_len;
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+    EVP_DigestUpdate(ctx, data, len);
+    EVP_DigestFinal_ex(ctx, id_out->hash, &hash_len);
+    EVP_MD_CTX_free(ctx);
+}
