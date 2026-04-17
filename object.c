@@ -202,6 +202,7 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
 }
 
 
+
 void compute_hash(const void *data, size_t len, ObjectID *id_out) {
     unsigned int hash_len;
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
