@@ -10,11 +10,15 @@
 //   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
 
 #include "tree.h"
+#include "index.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+
+// Forward declaration (implemented in object.c)
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 
 // ─── Mode Constants ─────────────────────────────────────────────────────────
 
@@ -83,6 +87,148 @@ static int compare_tree_entries(const void *a, const void *b) {
     return strcmp(((const TreeEntry *)a)->name, ((const TreeEntry *)b)->name);
 }
 
+// Check whether a path is inside the provided prefix scope.
+static int path_in_scope(const char *path, const char *prefix) {
+    size_t prefix_len = strlen(prefix);
+    if (prefix_len == 0) return path[0] != '\0';
+    return strncmp(path, prefix, prefix_len) == 0;
+}
+
+// Extract the next path component after prefix.
+// For path="src/lib/main.c" and prefix="src/", this yields name_out="lib", is_dir_out=1.
+static int next_component(const char *path, const char *prefix, char *name_out, size_t name_size, int *is_dir_out) {
+    const char *rest;
+    const char *slash;
+    size_t name_len;
+
+    if (!path || !prefix || !name_out || !is_dir_out || name_size == 0) return -1;
+    if (!path_in_scope(path, prefix)) return -1;
+
+    rest = path + strlen(prefix);
+    if (*rest == '\0') return -1;
+
+    slash = strchr(rest, '/');
+    if (slash) {
+        name_len = (size_t)(slash - rest);
+        *is_dir_out = 1;
+    } else {
+        name_len = strlen(rest);
+        *is_dir_out = 0;
+    }
+
+    if (name_len == 0 || name_len >= name_size) return -1;
+    memcpy(name_out, rest, name_len);
+    name_out[name_len] = '\0';
+    return 0;
+}
+
+static TreeEntry *tree_find_entry(Tree *tree, const char *name) {
+    for (int i = 0; i < tree->count; i++) {
+        if (strcmp(tree->entries[i].name, name) == 0) return &tree->entries[i];
+    }
+    return NULL;
+}
+
+static int load_index_snapshot(Index *index) {
+    FILE *f;
+    char line[1200];
+
+    index->count = 0;
+    f = fopen(INDEX_FILE, "r");
+    if (!f) return 0;
+
+    while (index->count < MAX_INDEX_ENTRIES && fgets(line, sizeof(line), f) != NULL) {
+        IndexEntry *e = &index->entries[index->count];
+        char hash_hex[HASH_HEX_SIZE + 1];
+        unsigned long long mtime_tmp;
+        int rc = sscanf(line, "%o %64s %llu %u %511[^\n]",
+                        &e->mode,
+                        hash_hex,
+                        &mtime_tmp,
+                        &e->size,
+                        e->path);
+        if (rc != 5 || hex_to_hash(hash_hex, &e->hash) != 0) {
+            fclose(f);
+            return -1;
+        }
+        e->mtime_sec = (uint64_t)mtime_tmp;
+        index->count++;
+    }
+
+    fclose(f);
+    return 0;
+}
+
+static uint32_t normalize_file_mode(uint32_t mode) {
+    if (mode == MODE_EXEC) return MODE_EXEC;
+    return MODE_FILE;
+}
+
+static int write_tree_level(const Index *index, const char *prefix, ObjectID *id_out) {
+    Tree tree;
+    void *serialized = NULL;
+    size_t serialized_len = 0;
+
+    tree.count = 0;
+
+    for (int i = 0; i < index->count; i++) {
+        char name[256];
+        int is_dir;
+        TreeEntry *existing;
+
+        if (next_component(index->entries[i].path, prefix, name, sizeof(name), &is_dir) != 0) {
+            continue;
+        }
+
+        existing = tree_find_entry(&tree, name);
+        if (existing) {
+            // Reject ambiguous paths like both "a" and "a/..." in the same tree level.
+            if ((is_dir && existing->mode != MODE_DIR) || (!is_dir && existing->mode == MODE_DIR)) {
+                return -1;
+            }
+            continue;
+        }
+
+        if (tree.count >= MAX_TREE_ENTRIES) {
+            return -1;
+        }
+
+        TreeEntry *entry = &tree.entries[tree.count];
+        memset(entry, 0, sizeof(*entry));
+        snprintf(entry->name, sizeof(entry->name), "%s", name);
+
+        if (is_dir) {
+            char child_prefix[768];
+            if (snprintf(child_prefix, sizeof(child_prefix), "%s%s/", prefix, name) >= (int)sizeof(child_prefix)) {
+                return -1;
+            }
+            if (write_tree_level(index, child_prefix, &entry->hash) != 0) {
+                return -1;
+            }
+            entry->mode = MODE_DIR;
+        } else {
+            entry->hash = index->entries[i].hash;
+            entry->mode = normalize_file_mode(index->entries[i].mode);
+        }
+
+        tree.count++;
+    }
+
+    if (tree.count == 0) return -1;
+
+    if (tree_serialize(&tree, &serialized, &serialized_len) != 0) {
+        return -1;
+    }
+
+    if (object_write(OBJ_TREE, serialized, serialized_len, id_out) != 0) {
+        free(serialized);
+        return -1;
+    }
+
+    free(serialized);
+    return 0;
+}
+
 // Serialize a Tree struct into binary format for storage.
 // Caller must free(*data_out).
 // Returns 0 on success, -1 on error.
@@ -130,8 +276,13 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 //
 // Returns 0 on success, -1 on error.
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    Index index;
+
+    if (!id_out) return -1;
+
+    if (load_index_snapshot(&index) != 0) return -1;
+
+    if (index.count == 0) return -1;
+
+    return write_tree_level(&index, "", id_out);
 }
